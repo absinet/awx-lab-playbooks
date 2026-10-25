@@ -1,0 +1,142 @@
+---
+# 2web.yml - install and configure Apache on Ubuntu, run as apache:apache,
+# serving content from /data. index.html is uploaded manually (not managed here).
+#
+# AWX job template: set Limit = absubn02 so it only runs on that host.
+
+- name: Set up Apache web server
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    web_user: apache
+    web_group: apache
+    web_root: /data
+    web_port: 80
+    server_name: "{{ inventory_hostname }}"
+
+  tasks:
+    - name: Verify target is Debian/Ubuntu family
+      ansible.builtin.assert:
+        that: ansible_facts['os_family'] == 'Debian'
+        fail_msg: "{{ inventory_hostname }} is not Debian/Ubuntu - this playbook uses apache2/a2ensite"
+
+    - name: Install Apache
+      ansible.builtin.apt:
+        name: apache2
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create apache group
+      ansible.builtin.group:
+        name: "{{ web_group }}"
+        system: true
+        state: present
+
+    - name: Create apache user
+      ansible.builtin.user:
+        name: "{{ web_user }}"
+        group: "{{ web_group }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+        state: present
+
+    - name: Create content directory
+      ansible.builtin.file:
+        path: "{{ web_root }}"
+        state: directory
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0755"
+
+    - name: Run Apache as the apache user (envvars)
+      ansible.builtin.lineinfile:
+        path: /etc/apache2/envvars
+        regexp: "^export {{ item.key }}="
+        line: "export {{ item.key }}={{ item.value }}"
+      loop:
+        - { key: APACHE_RUN_USER, value: "{{ web_user }}" }
+        - { key: APACHE_RUN_GROUP, value: "{{ web_group }}" }
+      notify: Restart apache
+
+    - name: Deploy virtual host for /data
+      ansible.builtin.copy:
+        dest: /etc/apache2/sites-available/data.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible - do not edit by hand
+          <VirtualHost *:{{ web_port }}>
+              ServerName {{ server_name }}
+              DocumentRoot {{ web_root }}
+
+              <Directory {{ web_root }}>
+                  Options -Indexes +FollowSymLinks
+                  AllowOverride None
+                  Require all granted
+              </Directory>
+
+              DirectoryIndex index.html
+              ErrorLog ${APACHE_LOG_DIR}/data-error.log
+              CustomLog ${APACHE_LOG_DIR}/data-access.log combined
+          </VirtualHost>
+      notify: Restart apache
+
+    - name: Disable default site
+      ansible.builtin.command: a2dissite 000-default.conf
+      args:
+        removes: /etc/apache2/sites-enabled/000-default.conf
+      notify: Restart apache
+
+    - name: Enable data site
+      ansible.builtin.command: a2ensite data.conf
+      args:
+        creates: /etc/apache2/sites-enabled/data.conf
+      notify: Restart apache
+
+    - name: Validate Apache configuration
+      ansible.builtin.command: apache2ctl configtest
+      changed_when: false
+
+    - name: Ensure Apache is enabled and running
+      ansible.builtin.service:
+        name: apache2
+        state: started
+        enabled: true
+
+    - name: Apply pending restart now (so user change takes effect before checks)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check whether index.html has been uploaded
+      ansible.builtin.stat:
+        path: "{{ web_root }}/index.html"
+      register: index_file
+
+    - name: Remind to upload index.html
+      ansible.builtin.debug:
+        msg: "{{ web_root }}/index.html not found - upload it manually (owner {{ web_user }}:{{ web_group }})."
+      when: not index_file.stat.exists
+
+    - name: Confirm Apache worker processes run as apache
+      ansible.builtin.shell: >
+        ps -eo user:20,comm | awk '$2=="apache2" && $1!="root"{print $1}' | sort -u
+      register: worker_users
+      changed_when: false
+      failed_when: worker_users.stdout.strip() != web_user
+
+    - name: Check the site responds (only once index.html exists)
+      ansible.builtin.uri:
+        url: "http://localhost:{{ web_port }}/"
+        status_code: 200
+      when: index_file.stat.exists
+
+  handlers:
+    - name: Restart apache
+      ansible.builtin.service:
+        name: apache2
+        state: restarted
